@@ -1,251 +1,185 @@
-# API & Data Fetching
+# API & Data Fetching Standards
 
-## 🔌 API Layer Pattern
+This document establishes the end-to-end standard for data fetching in the application, from the raw API call to the React component consumption.
 
-### Structure
+## 1. Type Definitions & API Call
+
+**Rule**: Always define a Base Response type, then wrap it in `CoreHttpResponse<T>` when making the Axios call.
+
+### A. Define the Types
+Typically located in `types/` (e.g., `types/auth.ts` or `types/chat.ts`).
 
 ```typescript
-// api/[feature]/[feature]Api.ts
-import { axiosInstance } from "@/https/core";
-
-export interface FeatureResponse {
-  // Response type
-}
-
-export async function getFeature(id: string): Promise<FeatureResponse> {
-  const response = await axiosInstance.get(`/feature/${id}`);
-  return response.data;
+// types/chat.ts
+export interface ChatTokenResponse {
+  access_token: string;
+  user: {
+    id: string;
+    username: string;
+  };
 }
 ```
 
-### HTTP Client
-
-- Centralized axios instance di `https/core.ts`
-- Request/response interceptors untuk auth dan error handling
-- Type-safe API responses
-
-### Server Components vs Client Components
-
-**Server Components (Default)**
-
-- Tidak perlu `"use client"` directive
-- Render di server, tidak ada JavaScript di bundle
-- Dapat langsung fetch data dan access backend resources
-- Tidak bisa menggunakan hooks, event handlers, atau browser APIs
+### B. Implement the API Function
+Typically located in `api/` (e.g., `api/chatApi.ts`).
 
 ```typescript
-// app/[locale]/[route]/page.tsx (Server Component)
-import { getFeature } from "@/api/feature/featureApi";
+import { CoreHttpResponse } from "@/types/api/common";
+import axios from "axios";
+import { ChatTokenResponse } from "@/types/chat";
 
-export default async function FeaturePage({
-  params,
-}: {
-  params: { id: string };
-}) {
-  // Direct data fetching in Server Component
-  const data = await getFeature(params.id);
+export const getChatToken = async (): Promise<ChatTokenResponse> => {
+  // 1. Explicitly type the Axios response with CoreHttpResponse
+  const res: CoreHttpResponse<ChatTokenResponse> = await axios.get(
+    "/api/chat/get-token"
+  );
+  
+  // 2. Return the data payload (unwrapped from status/message if needed, or keeping structure based on requirement)
+  // Common pattern: Return the data part directly
+  return res.data; 
+};
+```
+
+## 2. React Query Hooks
+
+**Rule**: Encapsulate `useQuery` and `useMutation` logic inside custom hooks. Do not use `useQuery` directly in components for complex logic.
+
+### A. Data Fetching (`useQuery`)
+Create a hook file, e.g., `hooks/chat/useChatToken.ts`.
+
+```typescript
+import { useQuery } from "@tanstack/react-query";
+import { getChatToken } from "@/api/chatApi";
+
+export const useChatToken = () => {
+  return useQuery({
+    queryKey: ["chat", "token"], // Use consistent key namespacing
+    queryFn: async () => {
+      const data = await getChatToken();
+      return data;
+    },
+    // Optional: Add default options usually needed
+    staleTime: 5 * 60 * 1000, // 5 minutes
+  });
+};
+```
+
+### B. Data Mutation (`useMutation`)
+Create a hook file for actions, e.g., `hooks/chat/useSendMessage.ts`.
+
+```typescript
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { sendMessage } from "@/api/chatApi";
+import { toast } from "sonner"; // or your toast library
+
+export const useSendMessage = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: sendMessage,
+    onSuccess: () => {
+      // Invalidate queries to refresh data
+      queryClient.invalidateQueries({ queryKey: ["chat", "messages"] });
+      toast.success("Message sent successfully");
+    },
+    onError: (error: any) => {
+      toast.error(error?.message || "Failed to send message");
+    },
+  });
+};
+```
+
+## 3. Component Consumption
+
+**Rule**: Consume the custom hooks in your UI components. Handle `isLoading` and `isError` states gracefully.
+
+```tsx
+"use client";
+
+import { useChatToken } from "@/hooks/chat/useChatToken";
+import { useSendMessage } from "@/hooks/chat/useSendMessage";
+import { useState } from "react";
+
+export default function ChatComponent() {
+  // 1. Consumption of Query
+  const { data: tokenData, isLoading, isError } = useChatToken();
+  
+  // 2. Consumption of Mutation
+  const { mutate: sendMessage, isPending: isSending } = useSendMessage();
+
+  const [input, setInput] = useState("");
+
+  if (isLoading) return <div>Loading chat...</div>;
+  if (isError) return <div>Error loading chat token.</div>;
+
+  const handleSend = () => {
+    if (!input) return;
+    
+    sendMessage(
+      { message: input, token: tokenData?.access_token }, // Arguments matching your API function
+      {
+        onSuccess: () => setInput(""), // Component-specific side effect
+      }
+    );
+  };
 
   return (
-    <div>
-      <h1>{data.title}</h1>
-      {/* Client Component untuk interaktif */}
-      <ClientFeatureDetails data={data} />
+    <div className="p-4">
+      <h1>Logged in as: {tokenData?.user.username}</h1>
+      
+      <div className="flex gap-2">
+        <input 
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          disabled={isSending}
+          className="border p-2 rounded"
+        />
+        <button 
+          onClick={handleSend} 
+          disabled={isSending}
+          className="bg-blue-500 text-white p-2 rounded"
+        >
+          {isSending ? "Sending..." : "Send"}
+        </button>
+      </div>
     </div>
   );
 }
 ```
 
-**Client Components**
+## 4. Next.js Server Patterns (Server Components & Actions)
 
-- Perlu `"use client"` directive di top of file
-- Render di browser, memiliki JavaScript bundle
-- Dapat menggunakan hooks, event handlers, browser APIs
-- Gunakan untuk interaktif components (forms, buttons, modals)
+While the above standard applies to Client Component data fetching, Next.js Server Components have distinct patterns.
+
+### A. Server Component Fetching
+Directly call internal logic or `fetch` without `useEffect` or `useQuery`.
 
 ```typescript
-// components/feature/FeatureForm.tsx (Client Component)
-"use client";
-
-import { useActionState } from "react";
-import { createFeature } from "@/app/[locale]/[route]/actions";
-
-const initialState = {
-  message: '',
-  errors: {}
-};
-
-export default function FeatureForm() {
-  // useActionState (Next.js 15 / React 19) handle form state & errors
-  const [state, formAction, isPending] = useActionState(createFeature, initialState);
-
-  return (
-    <form action={formAction}>
-      <input name="title" />
-      {state?.errors?.title && <p className="text-red-500">{state.errors.title}</p>}
-      
-      <button type="submit" disabled={isPending}>
-        {isPending ? 'Submitting...' : 'Submit'}
-      </button>
-      
-      {state?.message && <p>{state.message}</p>}
-    </form>
-  );
+// app/users/page.tsx
+export default async function Page() {
+  const data = await getFeature("123"); // Direct async call
+  return <div>{data.title}</div>;
 }
 ```
 
-### Server Actions
-
-Server Actions untuk form submissions dan mutations:
+### B. Server Actions (Form Mutations)
+Use `useActionState` for handling form submissions that don't need rich interaction feedback or complex state.
 
 ```typescript
-// app/[locale]/[route]/actions.ts
+// actions.ts
 "use server";
-
 import { revalidatePath } from "next/cache";
-import { z } from "zod";
-
-const schema = z.object({
-  title: z.string().min(1),
-});
 
 export async function createFeature(prevState: any, formData: FormData) {
-  const validatedFields = schema.safeParse({
-    title: formData.get("title"),
-  });
-
-  if (!validatedFields.success) {
-    return {
-      errors: validatedFields.error.flatten().fieldErrors,
-      message: 'Validation Error',
-    };
-  }
-
-  try {
-    // Process data
-    // await db.feature.create(...)
-
-    revalidatePath("/features");
-    return { message: 'Success!' };
-  } catch (e) {
-    return { message: 'Failed to create feature' };
-  }
+  // Logic...
+  revalidatePath("/features");
+  return { message: "Success" };
 }
 ```
 
-### Route Handlers (API Routes)
+## 5. Caching Strategies
 
-Untuk API endpoints di Next.js:
-
-```typescript
-// app/api/[feature]/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { axiosInstance } from "@/https/core";
-
-// Next.js 15: Fetch requests are not cached by default (no-store)
-// To cache: fetch('...', { cache: 'force-cache' })
-
-export async function GET(request: NextRequest) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const id = searchParams.get("id");
-
-    const data = await getFeature(id!);
-
-    return NextResponse.json({ data });
-  } catch (error) {
-    return NextResponse.json(
-      { error: "Internal Server Error" },
-      { status: 500 }
-    );
-  }
-}
-```
-
-### Data Fetching Patterns
-
-**1. Server Component Data Fetching**
-
-```typescript
-// Direct fetch in Server Component
-// Next.js 15 default: Dynamic (no caching) unless specified
-export default async function Page({ params }: { params: { id: string } }) {
-  const data = await getFeature(params.id);
-  return <div>{data.title}</div>;
-}
-```
-
-**2. Streaming Data with `use` Hook (Client Component)**
-
-```typescript
-// Server Component
-import { Suspense } from 'react';
-import FeatureClient from './FeatureClient';
-
-export default function Page({ params }: { params: { id: string } }) {
-  // Start fetching, don't await
-  const featurePromise = getFeature(params.id);
-
-  return (
-    <Suspense fallback={<div>Loading...</div>}>
-      <FeatureClient featurePromise={featurePromise} />
-    </Suspense>
-  );
-}
-
-// Client Component
-"use client";
-import { use } from "react";
-
-export default function FeatureClient({ featurePromise }: { featurePromise: Promise<any> }) {
-  const data = use(featurePromise); // Unwraps promise
-  return <div>{data.title}</div>;
-}
-```
-
-**2. React Query (TanStack Query) untuk Client Components**
-
-```typescript
-"use client";
-
-import { useQuery } from "@tanstack/react-query";
-import { getFeature } from "@/api/feature/featureApi";
-
-export default function FeatureComponent({ id }: { id: string }) {
-  const { data, isLoading, error } = useQuery({
-    queryKey: ["feature", id],
-    queryFn: () => getFeature(id),
-  });
-
-  if (isLoading) return <Loading />;
-  if (error) return <Error />;
-
-  return <div>{data.title}</div>;
-}
-```
-
-**3. Streaming dengan Suspense**
-
-```typescript
-import { Suspense } from "react";
-import Loading from "@/components/atoms/Loading";
-
-export default function Page() {
-  return (
-    <Suspense fallback={<Loading />}>
-      <FeatureList />
-    </Suspense>
-  );
-}
-
-async function FeatureList() {
-  const data = await getFeatures();
-  return <div>{/* render data */}</div>;
-}
-```
-
-### Caching Strategies
-
-Next.js 15 caching configuration:
+Next.js 16 caching configuration:
 
 ```typescript
 // Default in Next.js 16 is 'no-store' (dynamic) for fetch
@@ -255,43 +189,12 @@ export const dynamic = "force-static";
 
 // Revalidate every 60 seconds
 export const revalidate = 60;
-
-// On-demand revalidation
-import { revalidatePath, revalidateTag } from "next/cache";
-
-export async function updateAction() {
-    'use server'
-    revalidatePath("/features");
-    revalidateTag("features");
-}
 ```
 
-## 🌐 gRPC Integration (Reference)
+## Summary Checklist
 
-**Note**: gRPC belum digunakan di proyek ini, tapi berikut pattern untuk referensi:
-
-```typescript
-// lib/grpc/client.ts
-import * as grpc from "@grpc/grpc-js";
-import * as protoLoader from "@grpc/proto-loader";
-
-const PROTO_PATH = "./path/to/service.proto";
-
-const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
-  keepCase: true,
-  longs: String,
-  enums: String,
-  defaults: true,
-  oneofs: true,
-});
-
-const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
-const service = protoDescriptor.serviceName as any;
-
-const client = new service.ServiceName(
-  "localhost:50051",
-  grpc.credentials.createInsecure()
-);
-
-export default client;
-```
+1.  [ ] **Type**: Base Response defined in `types/`.
+2.  [ ] **API**: `CoreHttpResponse` used in Axios call.
+3.  [ ] **Hook**: `useQuery` / `useMutation` wrapped in a custom hook file.
+4.  [ ] **Component**: Hook consumed with proper loading/error states.
+5.  [ ] **Server**: Use Server Components for initial page loads where possible.
